@@ -1,0 +1,532 @@
+---
+title: "Analysis of genes differentially expressed in _Oryza sativa_ during the interaction with the root hemiparasite _Striga hermonthica_"
+subtitle: 'Analysis using _Striga aciatica_ UVA1 Genome Assembly v2.0 reference'
+editor_options:
+  chunk_output_type: console
+output:
+  html_document: 
+    fig_caption: yes
+    number_sections: yes
+    toc: yes
+    css: style.css
+  pdf_document:
+    toc: yes
+always_allow_html: yes
+---
+  
+```{r setup, include=FALSE, error=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+setwd("C:/Users/283899K/Dropbox/Family Room/DESeq_Rice")
+
+### in case you don't know the Dropbox path, this will do it for you
+library(jsonlite)
+
+file_name<-list.files(paste(Sys.getenv(x = "APPDATA"),"Dropbox", sep="/"), pattern = "*.json", full.names = T)
+if (length(file_name)==0){
+  file_name<-list.files(paste(Sys.getenv(x = "LOCALAPPDATA"),"Dropbox", sep="/"), pattern = "*.json", full.names = T)}
+
+file_content<-fromJSON(txt=file_name)$personal
+dropbox.path <-gsub("\\", "/", file_content$path, fixed = TRUE)
+dropbox.path
+## setwd(paste0(dropbox.path, "/Family Room"))
+
+```
+
+# Libraries
+
+```{r message=FALSE, warning=FALSE}
+if (!require("pacman")) install.packages("pacman")
+if (!require("BiocManager")) install.packages("BiocManager")
+pacman::p_load(ggplot2, ggpubr, tidyverse, factoextra, edgeR, limma, gplots, ggrepel, EnhancedVolcano, patchwork, pals, DESeq2, openxlsx, RColorBrewer, MASS, data.table, install = TRUE)
+
+```
+
+# The datasets
+
+## Raw transcript counts and metadata
+
+```{r}
+#raw.counts <- fread("C:/Users/283899K/Dropbox/Family Room/02.analysis_nextflow/count_matrix_untrimmed/Osativa_204_v7.countmatrix.GEM.raw.txt", check.names = F)
+
+raw.counts <- read.delim("COUNTS_Striga_virulence.csv", sep = ",", check.names = F)
+
+raw.counts <- raw.counts %>% column_to_rownames(var = "gene")
+
+## What are the maximum counts for each sample
+colMax <- function(data) sapply(data, max, na.rm = TRUE)
+
+# colSort <- function(data, ...) sapply(data, sort, ...)
+colMax(raw.counts)
+
+exper_setup <- read.delim("Col_Info_2.csv", sep = ",", check.names = F)
+
+```
+
+## Subset only Rice samples from the count matrix
+
+```{r}
+
+rice.samples <- c("IR1_S64_1", "IR1_S64_2", "IR2_S65_1", "IR2_S65_2", "IR3_S66_1", "IR3_S66_2", "IR4_S67_1", "IR4_S67_2", "IR5_S68_1", "IR5_S68_2", "IR6_S69_1", "IR6_S69_2", "RN1_S55_1", "RN1_S55_2", "RN2_S56_1", "RN2_S56_2", "RN3_S57_1", "RN3_S57_2", "RN4_S58_1", "RN4_S58_2", "RN5_S59_1", "RN5_S59_2", "RN6_S60_1", "RN6_S60_2", "HE4_S165_1", "HE4_S165_2", "HE5_S166_1", "HE5_S166_2", "HE6_S167_1", "HE6_S167_2")
+
+counts.rice <- subset(raw.counts, select =rice.samples)
+names(exper_setup) <- c("sample_id", "variety","times","treatment", "sample")
+exper_setup <- exper_setup %>% filter(., sample_id %in% colnames(counts.rice))
+
+```
+## Check sample names bewteen counts and experimental setup
+Reorder the data and perform the checks.
+If the output to any of the 2 checks below is FALSE, then recheck the data
+
+```{r}
+names <- as.character(exper_setup$sample_id)
+counts.rice <- subset(counts.rice, select = names) ## reorder counts columns based on the experimental setup 
+dim(counts.rice)
+dim(exper_setup)
+
+## check the results
+# is.null(setdiff(colnames(counts), exper_setup$Sample_Name))
+all(colnames(counts.rice) %in% exper_setup$sample_id)
+all(colnames(counts.rice) == exper_setup$sample_id)
+
+m <- data.matrix(counts.rice[, 1:ncol(counts.rice)])# convert readcount table to matrix
+tibble(exper_setup) %>% 
+  rmarkdown::paged_table(.)
+
+```
+
+## Raw counts are converted to CPM and log-CPM
+
+```{r}
+## Calculate CPM from raw counts to normalize for different sequencing depth for each sample
+cpm <- apply(m,2, function(x) (x/sum(x))*1000000) 
+
+## remove any genes with a CPM of less than 1 across all samples
+m1 <- m[rowSums(cpm < 1) < 36, ]  
+```
+
+# Counts to keep
+```{r}
+options(scipen = 100)
+thresh <- m1 > 1 ###to confirm the output of filtering
+# head(thresh)
+table(rowSums(thresh))## there are 7847 genes that have TRUES in all 174 samples
+keep <- rowSums(thresh) >= 10 ## keep genes that have at least 10 TRUES in each row of thresh--- the number is very low!
+counts.keep <- m1[keep,] ## subset the rows of count-data to keep the more highly expressed genes
+summary(keep)
+dim(counts.keep)
+plot(m1[,5],m1[,5])
+
+```
+
+# Processing (checking counts with limma approach)
+## Create DGEList
+
+```{r}
+d0 <- DGEList(counts.keep, group = exper_setup$variety)
+d0[1:3, 1:4]
+
+```
+
+# Whats in the read-count data? CPM log counts exploration and filtering of lowly expressed genes
+
+## Before normalization and removing unexpressed genes
+
+```{r, dpi=300}
+design <- model.matrix(~variety, exper_setup)
+a <- DGEList(counts = m1, group = exper_setup$treatment)
+b <- voom(a,design, normalize.method = "none", plot = TRUE)
+logCounts <- log(m1, 10)
+is.na(logCounts) <- (logCounts == "-Inf")
+
+boxplot(logCounts, main = "Boxplots of logCPMs (unnormalised)", xlab = "",
+        ylab = bquote("Raw reads counts per gene (Log "[10]~")"), axes = FALSE)
+axis(2)
+axis(1,at = c(1:length(colnames(logCounts))), labels = colnames(logCounts), las = 2,cex.axis = 0.3)
+abline(h = median(logCounts),col = "blue")
+rm(a, b, logCounts)## clean up
+
+```
+
+## Normalization of the filtered raw reads-count data using Quantile
+
+```{r, dpi=300, warning=FALSE}
+#options(scipen=999)
+## Calculate normalization factors
+d1 <- calcNormFactors(d0)
+d1[1:3, 1:4]
+par(oma=c(2,2,2,2))
+barplot(d1$samples$lib.size,names = colnames(d1),las = 2)
+title("Barplot of library sizes")
+
+dge <- voom(d1,design, normalize.method = "quantile", plot = T)
+logCounts <- log(dge$E, 10)
+is.na(logCounts) <- (logCounts == "NaN")
+
+boxplot(logCounts, main = "Boxplots of logCPMs (Quantile normalization)", xlab = "", 
+        ylab = bquote("Raw reads counts per million (Log "[10]~")"),axes = FALSE)
+axis(2)
+axis(1, at = c(1:length(colnames(logCounts))),labels = colnames(logCounts),las = 2,cex.axis = 0.5)
+abline(h = median(logCounts),col = "blue")
+rm(logCounts)
+
+```
+
+# Explore the filtered and normalised data further
+
+```{r}
+# We estimate the variance for each row in the logcounts matrix
+logcounts <- log(dge$E)
+is.na(logcounts) <- (logcounts == "NaN")
+
+var_genes <- apply(logcounts, 1, var)
+head(var_genes)
+###Get the gene names for the top 500 most variable genes
+select_var <- names(sort(var_genes, decreasing = TRUE))[1:50]
+# head(select_var)
+# Subset logcounts matrix
+
+highly_variable_lcpm <- logcounts[select_var,]
+dim(highly_variable_lcpm)
+# head(highly_variable_lcpm)
+## Get some nicer colours
+mypalette <- RColorBrewer::brewer.pal(11,"RdGy")
+morecols <- colorRampPalette(mypalette)
+
+svg(filename = "High_var_genes.heatmap.svg", height = 7, width = 14)
+heatmap.2(highly_variable_lcpm,
+          col = (morecols(20)),
+          trace = "none", 
+          margins = c(10,20),
+          scale = "col",
+          key.title = "",
+          Rowv = T, 
+          Colv = T,
+          dendrogram = "column")
+dev.off()
+# rm(var_genes, highly_variable_lcpm)
+
+```
+![Top variable CPM read counts](./High_var_genes.heatmap.svg)
+
+## PCA of transformed data
+
+```{r}
+set.seed(9)
+pcs <- prcomp(dge$E)
+fviz_eig(pcs, main = "Scree Plot of PCs in data")
+head(get_eigenvalue(pcs))
+exper_setup$Time.2 <- paste(exper_setup$times, exper_setup$variety, exper_setup$treatment, sep = "_")
+prinComp <- cbind(exper_setup, pcs$rotation[,1:3])
+
+```
+
+Everything looks fine by this stage. Most of the varience could be explained by the first 2 principle components
+
+### Scatter Plots
+#### Biological replicate effect
+
+```{r, dpi=300}
+p.seqrep <- ggplot(prinComp, 
+                   aes(x = PC1,
+                       y = PC2, 
+                       colour =variety , 
+                       shape = treatment)) + 
+  geom_point(size = 3) +
+  xlab("PC1 (58.51%)") + ## Check this values from head(get_eigenvalue(pcs))
+  ylab("PC2 (8.551715%)") +
+  ggtitle("PCA and variety and treatment") + 
+  scale_colour_manual(values = c("blue3", "orange3", "brown", "red", "#39FF14", "navy")) + 
+  theme_minimal()
+
+ggsave(p.seqrep, filename = "PCA_Rep.svg", width = 10, height = 8)
+
+```
+
+![](./PCA_Rep.svg)
+## Multidimensional scaling (MDS) plot
+
+### Treatment vs variety
+
+```{r}
+treatment <- factor(exper_setup$treatment)
+
+group <- interaction(treatment)
+plotMDS(dge, col = as.numeric(group), pch = 19, main="MDS plot of transformed cpm counts")
+
+mds <- plotMDS(dge, col = as.numeric(group), cex = 1.2, pch = 16, plot = F)
+toplot <- data.frame(Dim1 = mds$x, 
+                     Dim2 = mds$y, 
+                     Variety = exper_setup$variety)
+
+p <- ggplot(toplot, aes(Dim1, Dim2, colour = Variety)) + 
+  geom_point(size = 2) +
+  xlab(bquote("Leading log" [2]~"Fold change DIM 1")) +
+  ylab(bquote("Leading log" [2]~"Fold change DIM 2")) + 
+  theme_bw() +
+  scale_colour_manual(values = c("blue3", "orange3", "brown", "red", "#39FF14", "navy"))
+ggsave(plot = p, filename = "MDSplot.svg", height = 8.7, width = 10)
+
+```
+
+![MDS plot](./MDSplot.svg)
+
+scale colors using the <a href="http://127.0.0.1:10094/library/pals/doc/pals_examples.html" target="_blank">PALS</a> package
+
+# Voom transformation and calculation of variance weights
+```{r}
+# mm <- model.matrix(~0 + group)
+design = model.matrix(~0+variety, data = exper_setup)
+y <- voom(d1, design = design, plot = T)
+
+```
+
+
+## Fitting linear models in limma
+
+```{r}
+fit <- lmFit(y, design)
+head(coef(fit))
+
+```
+
+Empirical Bayes smoothing of standard errors (shrinks standard errors that are much larger or smaller than those from other genes towards the average standard error) (see <a href="https://www.degruyter.com/doi/10.2202/1544-6115.1027" target="_blank">here</a>)
+
+```{r}
+fit <- eBayes(fit)
+
+```
+
+## What genes are most differentially expressed
+Get the coefficients running `head(coef(fit))`
+
+```{r}
+options(scipen = 0, digits = 7)
+top.table <- topTable(fit, coef = 1, sort.by = "p", n = Inf, resort.by = "M", adjust.method = "BH", p.value = 0.05, lfc = 2)
+top.table <- topTable(fit, coef = 1, sort.by = "p", n = Inf, resort.by = "M",adjust.method = "BH")
+tibble(top.table %>% rownames_to_column(., var = "gene")) %>% 
+  rmarkdown::paged_table(.)
+
+```
+
+## Volcano plots limma-voom
+
+```{r, dpi=300}
+gene_list <- topTable(fit, coef = 4, sort.by = "logFC", n = Inf, adjust.method = "BH")
+barplot(gene_list$logFC)
+
+gene_list$diffexpressed <- "NO"
+# if log2Foldchange >= 1.8 and pvalue <= 0.01, set as "UP" 
+gene_list$diffexpressed[gene_list$logFC >= 2 & gene_list$P.Value <= 0.01] <- "UP"
+# if log2Foldchange <= -1.8 and pvalue <= 0.01, set as "DOWN"
+gene_list$diffexpressed[gene_list$logFC <= -1 & gene_list$P.Value <= 0.01] <- "DOWN"
+
+(plt1 <- ggplot(data = gene_list, aes(x = logFC, y = -log10(P.Value), col = diffexpressed)) + 
+  geom_point() + 
+  geom_vline(xintercept = c(-2, 2), col = "black", linetype = "dotted") +
+  geom_hline(yintercept = -log10(0.01), col = "black", linetype = "dotted") +
+  scale_colour_manual(name = "Differential expression", values = c("red", "grey", "blue")) +
+  ggtitle(expression("Variety..."~"P" <= 0.01~"; LogFC" >= "|2|")) +
+  xlab(bquote("Log" [2]~ "fold change", splice = TRUE)) +
+  ylab(bquote("-Log" [10]~italic("P")~"-value", splice = TRUE)) +
+  theme(legend.position = "bottom") + 
+  theme_bw())
+
+```
+
+Check the different contrasts as needed
+
+# DESeq DGE analysis
+
+Using the <a href="http://bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html" target="_blank">DESeq protocol</a> We analysed the data through using DESeq to see if we can replicate the DEG's identified using limma-voom
+
+## Create DESeq object
+
+```{r}
+exper_setup$sample <- factor(exper_setup$sample)
+exper_setup$times <- factor(exper_setup$times)
+exper_setup$sample_id <- factor(exper_setup$sample_id)
+exper_setup$variety <- factor(exper_setup$variety)
+
+dds.raw <- DESeqDataSetFromMatrix(countData = counts.keep, colData = exper_setup, design = ~0+variety)
+
+## Collapse Batches for each sample
+dds <- collapseReplicates(dds.raw, dds.raw$sample, dds.raw$sample_id)
+```
+
+## Examine the colData 
+Check column names of the collapsed data to ensure samples sequenced in different lanes have been placed correctly under same sample name
+
+The `stopifnot` should break when things go wrong
+
+```{r}
+colData(dds)
+colnames(dds)
+
+# check that the sum of the counts for "sampe2" is the same
+# as the counts in the "sample2  " column in dds. This is one of the samples that was resequenced.
+
+matchFirstLevel <- dds.raw$sample == levels(dds.raw$sample)[2]
+stopifnot(all(rowSums(counts(dds.raw[,matchFirstLevel])) == counts(dds[,2])))
+
+```
+
+## Run analysis
+
+```{r}
+dds <- DESeq(dds)
+# dds <- DESeq(dds.raw)
+
+resultsNames(dds)
+## Check the size factors
+sizeFactors(dds)
+## Total number of raw counts per sample
+colSums(counts(dds))
+## Total number of normalized counts per sample
+colSums(counts(dds, normalized = T))
+## Estimate gene-wise dispersion
+plotDispEsts(dds)
+
+```
+
+## See results
+
+```{r}
+res = results(dds)
+res
+plotMA(res)
+
+d <- plotCounts(dds, gene = which.min(res$padj), intgroup = "variety", returnData = TRUE)
+ggplot(d, aes(x = variety, y = count, colour = variety)) + 
+  geom_point(position = position_jitter(w = 0.1, h = 0)) + 
+  scale_y_log10() +
+  ylab(bquote("Log" [10]~"(Count)", splice = TRUE))
+
+```
+
+## Contrasts
+
+```{r}
+resultsNames(dds) ## see available contrasts
+
+## 1
+res.e3 <- results(dds, contrast = c('variety', 'IAC165_3DAI', 'SH_GR24_12HRS_CTRL'))
+res.e3 <- as.data.frame(res.e3) %>%
+  rownames_to_column(var = "gene") %>% 
+    data.frame() #%>% 
+p1 <- EnhancedVolcano(res.e3,
+    lab = res.e3$gene,
+    x = 'log2FoldChange',
+    y = 'pvalue',
+    title = "IAC165_3DAI",
+    labSize = 5,
+    col = c('#616161', 'orange2', 'blue2', 'red3'),
+    pointSize = 2)
+
+## 2
+res.e9 <- results(dds, contrast = c('variety', 'IAC165_9DAI', 'SH_GR24_12HRS_CTRL'))
+res.e9 <- as.data.frame(res.e9) %>%
+  rownames_to_column(var = "gene") %>% 
+    data.frame() #%>% 
+      # left_join(dplyr::distinct(annotation.df, gene, .keep_all = T))
+
+p2 <- EnhancedVolcano(res.e9,
+    lab = res.e9$gene,
+    x = 'log2FoldChange',
+    y = 'pvalue',
+    title = "IAC165_9DAI",
+    labSize = 5,
+    col = c('#616161', 'orange2', 'blue2', 'red3'),
+    pointSize = 2)
+
+## 1
+res.l3 <- results(dds, contrast = c("variety","NIP_3DAI","SH_GR24_12HRS_CTRL"))
+res.l3 <- as.data.frame(res.l3) %>%
+  rownames_to_column(var = "gene") %>% 
+    data.frame() #%>% 
+      # left_join(dplyr::distinct(annotation.df, gene, .keep_all = T)) 
+p3 <- EnhancedVolcano(res.l3,
+    lab = res.l3$gene,
+    x = 'log2FoldChange',
+    y = 'pvalue',
+    title = "Nip3DAI",
+    labSize = 5,
+    col = c('#616161', 'orange2', 'blue2', 'red3'),
+    pointSize = 2)
+
+## 2
+res.l9 <- results(dds, contrast = c("variety","NIP_9DAI","SH_GR24_12HRS_CTRL"))
+res.l9 <- as.data.frame(res.l9) %>%
+  rownames_to_column(var = "gene") %>% 
+    data.frame() #%>% 
+      # left_join(dplyr::distinct(annotation.df, gene, .keep_all = T)) 
+p4 <- EnhancedVolcano(res.l9,
+    lab = res.l9$gene,
+    x = 'log2FoldChange',
+    y = 'pvalue',
+    title = "Nip9DAI",
+    labSize = 5,
+    col = c('#616161', 'orange2', 'blue2', 'red3'),
+    pointSize = 2)
+
+
+svg("DESeq2_MA_plots_all_contrasts_SH_OS.svg", height = 20, width = 20)
+pdf("DESeq2_MA_plots_all_contrasts_SH_OS.pdf", height = 20, width = 20)
+
+(p1|p2)/(p3|p4)
+
+dev.off()
+
+```
+
+![](./DESeq2_MA_plots_all_contrasts.svg)
+
+```{r}
+ix = which.min(res.e3$padj)
+barplot(assay(dds)[ix,],las=2, main=rownames(dds)[ix])
+plot.new()
+ix = which.min(res.e9$padj)
+barplot(assay(dds)[ix,],las=2, main=rownames(dds)[ix])
+plot.new()
+ix = which.min(res.l3$padj)
+barplot(assay(dds)[ix,],las=2, main=rownames(dds)[ix])
+plot.new()
+ix = which.min(res.l9$padj)
+barplot(assay(dds)[ix,],las=2, main=rownames(dds)[ix])
+
+```
+
+
+## Add annotations if applicable and write to single Excel Workbook
+
+Activate `eval=TRUE` when running for the first time only. Otherwise no need overwriting the excel file over and over with each knit
+```{r, eval=FALSE}
+
+
+wb <- createWorkbook()
+addWorksheet(wb, "IR653DAI")
+addWorksheet(wb, "IR659DAI")
+addWorksheet(wb, "Nip3DAI")
+addWorksheet(wb, "Nip9DAI")
+writeData(wb, sheet = "IR653DAI", res.e3)
+writeData(wb, sheet = "IR659DAI", res.e9)
+writeData(wb, sheet = "Nip3DAI", res.l3)
+writeData(wb, sheet = "Nip9DAI", res.l9)
+saveWorkbook(wb, "DESeq_DGE_results_SH_OS.xlsx", overwrite = TRUE)
+
+```
+
+This script was last updated on:
+  
+```{r echo=FALSE}
+cat(as.character(format(Sys.time(), "%a %d %b %Y, %H:%M:%S")))
+
+```
+
+................... THE END ......................
+
+<span style="color:DarkBlue; font-size:9px;">
+  Author: <a href="https://au.linkedin.com/in/fmobegi" target="_blank">Fredrick M. Mobegi, PhD</a><br/>
+  Created: 17-08-2021 Tue 16:30h<br/>
+  Copyright &copy; 2020 Fredrick Mobegi | This notebook is for reference purposes only and may contain links to embargoed or legally privileged data.
+</span>
+
